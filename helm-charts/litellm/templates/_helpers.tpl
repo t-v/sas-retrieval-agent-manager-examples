@@ -116,6 +116,176 @@ default
 {{- if and (include "litellm.databaseEnabled" .) .Values.migrationJob.enabled -}}true{{- end -}}
 {{- end -}}
 
+{{/* Non-empty when the database initialization Job is rendered. */}}
+{{- define "litellm.dbInitEnabled" -}}
+{{- if and (include "litellm.databaseEnabled" .) .Values.database.init.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/* ── Database initialization ─────────────────────────────────────────── */}}
+
+{{- define "litellm.dbInit.fullname" -}}
+{{- printf "%s-db-init" (include "litellm.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+Labels for the initialization Job and its owned objects. `component: db-init`
+keeps them out of the proxy Service's selector.
+*/}}
+{{- define "litellm.dbInit.labels" -}}
+helm.sh/chart: {{ include "litellm.chart" . }}
+app.kubernetes.io/name: {{ include "litellm.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: db-init
+{{- with .Chart.AppVersion }}
+app.kubernetes.io/version: {{ . | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{/* Non-empty when the chart owns the admin Secret, rather than referencing one. */}}
+{{- define "litellm.dbInit.ownsAdminSecret" -}}
+{{- if not .Values.database.init.admin.existingSecret.name -}}true{{- end -}}
+{{- end -}}
+
+{{- define "litellm.dbInit.adminSecretName" -}}
+{{- if .Values.database.init.admin.existingSecret.name -}}
+{{- .Values.database.init.admin.existingSecret.name -}}
+{{- else -}}
+{{- printf "%s-admin" (include "litellm.dbInit.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "litellm.dbInit.adminUsernameKey" -}}
+{{- if .Values.database.init.admin.existingSecret.name -}}
+{{- default "username" .Values.database.init.admin.existingSecret.usernameKey -}}
+{{- else -}}
+username
+{{- end -}}
+{{- end -}}
+
+{{- define "litellm.dbInit.adminPasswordKey" -}}
+{{- if .Values.database.init.admin.existingSecret.name -}}
+{{- default "password" .Values.database.init.admin.existingSecret.passwordKey -}}
+{{- else -}}
+password
+{{- end -}}
+{{- end -}}
+
+{{/*
+Non-empty when the cleanup container is rendered.
+
+Cleanup erases the admin credentials from the Secret the chart created. With
+`admin.existingSecret` the chart created nothing, so there is nothing of ours
+to erase and no RBAC to grant — the operator owns that Secret's lifecycle.
+*/}}
+{{- define "litellm.dbInit.cleanupEnabled" -}}
+{{- if and (include "litellm.dbInitEnabled" .) .Values.database.init.cleanup (include "litellm.dbInit.ownsAdminSecret" .) -}}true{{- end -}}
+{{- end -}}
+
+{{- define "litellm.dbInit.serviceAccountName" -}}
+{{- if .Values.database.init.serviceAccount.create -}}
+{{- default (include "litellm.dbInit.fullname" .) .Values.database.init.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.database.init.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The container that talks to PostgreSQL.
+
+Rendered as an init container when cleanup is on and as the only ordinary
+container when it is off, so it is defined once here rather than twice in the
+Job. Kubernetes runs init containers to completion before any ordinary
+container starts, which is exactly the ordering the cleanup step needs: a
+failed initialization never reaches the step that erases the credentials.
+*/}}
+{{- define "litellm.dbInit.psqlContainer" -}}
+- name: db-init
+  image: "{{ .Values.database.init.image.repository }}:{{ .Values.database.init.image.tag }}"
+  imagePullPolicy: {{ .Values.database.init.image.pullPolicy }}
+  command: ["/bin/sh", "/scripts/init.sh"]
+  {{- with .Values.database.init.securityContext }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  env:
+    - name: PGHOST
+      {{- if .Values.database.existingSecret.hostKey }}
+      valueFrom:
+        secretKeyRef:
+          name: {{ .Values.database.existingSecret.name }}
+          key: {{ .Values.database.existingSecret.hostKey }}
+      {{- else }}
+      value: {{ .Values.database.host | quote }}
+      {{- end }}
+    - name: PGPORT
+      value: {{ .Values.database.port | quote }}
+    {{- /* The maintenance database. CREATE DATABASE cannot run inside the
+           database being created, so the session starts here. */}}
+    - name: PGDATABASE
+      value: {{ .Values.database.init.admin.database | quote }}
+    {{- $sslMode := .Values.database.init.admin.sslMode | default .Values.database.sslMode }}
+    {{- with $sslMode }}
+    - name: PGSSLMODE
+      value: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.database.sslRootCert }}
+    - name: PGSSLROOTCERT
+      value: {{ . | quote }}
+    {{- end }}
+    - name: DB_NAME
+      value: {{ .Values.database.name | quote }}
+    - name: DB_SCHEMA
+      value: {{ .Values.database.schema | quote }}
+    - name: WAIT_TIMEOUT
+      value: {{ .Values.database.init.waitTimeout | quote }}
+  {{- with .Values.database.init.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  volumeMounts:
+    - name: scripts
+      mountPath: /scripts
+      readOnly: true
+    - name: admin-credentials
+      mountPath: /secret/admin
+      readOnly: true
+    - name: service-credentials
+      mountPath: /secret/service
+      readOnly: true
+    {{- with .Values.volumeMounts }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end -}}
+
+{{/*
+Hook annotations shared by the initialization Job and the objects it needs.
+
+The Job runs as a Helm hook so that it completes before the migration Job,
+which is itself a hook. Everything the Job consumes — the Secret, the scripts,
+the RBAC — therefore has to be a hook too, at a lower weight; an ordinary
+resource does not exist yet when a pre-install hook runs.
+
+Invoke with a dict: (dict "root" $ "weight" "-10").
+*/}}
+{{- define "litellm.dbInit.hookAnnotations" -}}
+{{- $root := .root -}}
+{{- $init := $root.Values.database.init -}}
+{{- if $init.hooks.helm.enabled }}
+helm.sh/hook: pre-install,pre-upgrade
+helm.sh/hook-delete-policy: before-hook-creation
+helm.sh/hook-weight: {{ .weight | quote }}
+{{- end }}
+{{- if $init.hooks.argocd.enabled }}
+argocd.argoproj.io/hook: PreSync
+argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+argocd.argoproj.io/sync-wave: {{ $init.hooks.argocd.syncWave | quote }}
+{{- end }}
+{{- end -}}
+
 {{/* ── Config file ─────────────────────────────────────────────────────── */}}
 
 {{- define "litellm.configMapName" -}}
@@ -464,6 +634,37 @@ the value; the same mistake found at runtime is an opaque CrashLoopBackOff.
 {{- end -}}
 {{- if not .Values.database.existingSecret.name -}}
 {{- fail "database.existingSecret.name is required when the database flow is enabled. This chart reads database credentials from a Secret only and accepts no inline password." -}}
+{{- end -}}
+{{- end -}}
+
+{{- if .Values.database.init.enabled -}}
+{{- if not (include "litellm.databaseEnabled" .) -}}
+{{- fail "database.init.enabled requires the database flow. Set modelManagement.mode: database, or database.enabled: true." -}}
+{{- end -}}
+{{- $admin := .Values.database.init.admin -}}
+{{- if not (or $admin.existingSecret.name (and $admin.username $admin.password)) -}}
+{{- fail "database.init needs administrator credentials: set database.init.admin.existingSecret.name, or both database.init.admin.username and database.init.admin.password." -}}
+{{- end -}}
+{{- if and $admin.existingSecret.name (or $admin.username $admin.password) -}}
+{{- fail "set either database.init.admin.existingSecret.name or the inline database.init.admin.username/password, not both. Two sources for one credential is ambiguous about which the Job uses and which gets erased." -}}
+{{- end -}}
+{{- if ne .Values.database.auth.mode "password" -}}
+{{- fail (printf "database.init.enabled requires database.auth.mode \"password\", got %q. Under %s the login is issued by the cloud IAM provider, so there is no password for this Job to set on a role." .Values.database.auth.mode .Values.database.auth.mode) -}}
+{{- end -}}
+{{- if .Values.database.existingSecret.urlKey -}}
+{{- fail "database.init cannot be used with database.existingSecret.urlKey. The Job creates the login role from a discrete username and password; a connection URL gives it neither. Use the discrete usernameKey and passwordKey instead." -}}
+{{- end -}}
+{{- if and (not .Values.database.host) (not .Values.database.existingSecret.hostKey) -}}
+{{- fail "database.host or database.existingSecret.hostKey is required when database.init.enabled is true." -}}
+{{- end -}}
+{{- if and .Values.database.init.createSchema (not .Values.database.schema) -}}
+{{- fail "database.init.createSchema is true but database.schema is empty. Name the schema, or set createSchema: false to use the database's default." -}}
+{{- end -}}
+{{- if not .Values.database.init.admin.database -}}
+{{- fail "database.init.admin.database is required. CREATE DATABASE cannot run inside the database being created, so the Job connects to this one first — usually \"postgres\"." -}}
+{{- end -}}
+{{- if and .Values.database.init.hooks.helm.enabled (ge (int .Values.database.init.hooks.helm.weight) (int .Values.migrationJob.hooks.helm.weight)) -}}
+{{- fail (printf "database.init.hooks.helm.weight (%s) must be below migrationJob.hooks.helm.weight (%s), or the migration runs against a database that does not exist yet." (toString .Values.database.init.hooks.helm.weight) (toString .Values.migrationJob.hooks.helm.weight)) -}}
 {{- end -}}
 {{- end -}}
 

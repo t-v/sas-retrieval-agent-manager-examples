@@ -24,6 +24,7 @@ More than one may be enabled at a time, which is how you move from Ingress to Ga
 - [Provider credentials](#provider-credentials)
 - [Routing](#routing)
 - [Database](#database)
+- [Creating the database](#creating-the-database)
 - [Redis](#redis)
 - [Migration Job](#migration-job)
 - [Secrets](#secrets)
@@ -422,6 +423,96 @@ database:
 
 Read-only queries go to the replica and writes continue to the writer. Fields left empty fall back to the writer's values, including the credentials Secret.
 
+## Creating the database
+
+Everything above assumes the database, the login role, and the schema already exist — the usual case, because a DBA provisioned them. When they do not, `database.init` adds a one-shot Job that creates them.
+
+It is off by default. Turning it on does not change how the proxy connects; it only adds a step in front.
+
+```yaml
+database:
+  host: litellm-pg.example.com
+  name: litellm
+  schema: litellm
+  existingSecret:
+    name: litellm-db        # keys: username, password
+
+  init:
+    enabled: true
+    admin:
+      existingSecret:
+        name: litellm-pg-admin   # keys: username, password
+```
+
+### Which credential is which
+
+There are two, and conflating them is the easy mistake:
+
+| | Used by | Lifetime |
+| --- | --- | --- |
+| `database.existingSecret` | the proxy, every day | permanent |
+| `database.init.admin` | this Job, once | erased when the Job succeeds |
+
+`database.existingSecret` is the **input** to the Job, not something it reads back. The Job creates a login role with that username and password, makes it the owner of `database.name` and `database.schema`, and exits. The proxy then authenticates as that role. One Secret, written once by you, used by both.
+
+The admin credential is separate because creating a database and a role needs privileges the proxy must never hold.
+
+### What it runs
+
+Against the maintenance database named by `admin.database` (`postgres` by default, because `CREATE DATABASE` cannot run inside the database being created):
+
+1. `CREATE ROLE` for the service user, or `ALTER ROLE` to reset its password to match the Secret.
+2. `CREATE DATABASE` owned by that role.
+
+Then, connected to the new database:
+
+3. `GRANT ALL PRIVILEGES ON DATABASE` to the role.
+4. `CREATE SCHEMA ... AUTHORIZATION` the role, and `GRANT ALL ON SCHEMA`.
+5. `ALTER ROLE ... SET search_path`, so an interactive `psql` session as that role lands in the right schema.
+
+Each step is skipped when the object already exists, so the Job is safe to re-run. Step 4's `GRANT` runs even on an existing schema: PostgreSQL 15 stopped granting `CREATE` on `public` to everyone, and without it `prisma migrate deploy` fails with `permission denied for schema`.
+
+Turn individual steps off with `createDatabase`, `createUser`, and `createSchema` when a DBA has already done part of the work.
+
+### Password rotation
+
+The `ALTER ROLE` in step 1 is unconditional, so changing the password in `database.existingSecret` and upgrading resets the role to match. Without that, rotating the Secret would leave the proxy unable to log in until someone fixed the role by hand.
+
+### Erasing the admin credentials
+
+With inline `admin.username` / `admin.password`, the chart renders a Secret, the Job uses it, and a second container erases both keys from it the moment the Job succeeds.
+
+The ordering is structural rather than best-effort. The `psql` step is an **init container** and the cleanup is the **only ordinary container**, so Kubernetes will not start the cleanup until the init container has exited 0. A failed initialization therefore never reaches the erase step, and the credentials survive for the retry.
+
+The erase is a JSON merge patch setting both keys to `null`. That removes them whether or not they are still there, which makes it idempotent with no conditional logic — and that in turn is what lets it invoke `kubectl` directly, with no shell. The upstream `registry.k8s.io/kubectl` image is distroless and has no `/bin/sh`, so a shell script here would not run at all.
+
+The Secret object itself is kept, with its data keys gone. The Role carries `get` and `patch` on that one Secret name and deliberately no `delete`, so this chart never creates a Role that could delete Secrets in your namespace.
+
+> [!IMPORTANT]
+> Erasing the Kubernetes Secret does not remove an inline password from the **Helm release secret**, which `helm get values` can read. It is also restored for the length of the hook window on every upgrade, because re-running the Job needs it.
+>
+> To keep the admin password out of the release entirely, create the Secret yourself and name it under `admin.existingSecret`. The chart then modifies nothing — it only destroys what it created — and rotating that Secret afterwards is yours to do.
+
+The cleanest sequence for a one-time bootstrap is therefore: install with `init.enabled: true`, confirm the Job succeeded, then set `init.enabled: false` for every later upgrade.
+
+### Ordering
+
+The Job is a Helm hook at weight `-5`, ahead of the migration Job at `1`. The chart rejects a weight that is not below the migration's, because the failure it prevents surfaces as a confusing Prisma error about a database that does not exist rather than as a misconfigured value.
+
+Under a GitOps controller, turn `hooks.helm.enabled` off and `hooks.argocd.enabled` on; the sync waves keep the same order.
+
+### Ordinary failures
+
+- **`password authentication failed`** for the admin user: `admin.username` is not a login that may `CREATE DATABASE` and `CREATE ROLE`. On a managed service this is the server administrator, not `postgres`.
+- **The Job waits and then times out**: the server is not reachable from the cluster. `waitTimeout` bounds this at 300 seconds.
+- **`permission denied to create database`**: the admin user exists but lacks `CREATEDB`.
+
+Read what it actually did:
+
+```sh
+kubectl -n litellm logs job/litellm-db-init -c db-init
+```
+
 ## Redis
 
 Redis is the proxy's coordination store: cross-pod rate limits, spend tracking, and the pod lock manager that elects a single owner for shared background jobs.
@@ -718,6 +809,31 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `database.disablePreparedStatements` | Required in front of an external pooler | `false` |
 | `database.maxIdleConnectionLifetime` | Seconds; the proxy defaults to 60 | `""` |
 
+### Creating the database
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `database.init.enabled` | Create the database, role, and schema before anything else runs | `false` |
+| `database.init.admin.username` | Administrator login. Recorded in the Helm release secret | `""` |
+| `database.init.admin.password` | Administrator password. Recorded in the Helm release secret | `""` |
+| `database.init.admin.existingSecret.name` | Read the admin credentials from a Secret you own. The chart then erases nothing | `""` |
+| `database.init.admin.existingSecret.usernameKey`, `.passwordKey` | | `username`, `password` |
+| `database.init.admin.database` | Maintenance database to connect to for `CREATE DATABASE` | `postgres` |
+| `database.init.admin.sslMode` | Falls back to `database.sslMode` | `""` |
+| `database.init.createDatabase` | | `true` |
+| `database.init.createUser` | Create the login role, and reset its password to match the Secret | `true` |
+| `database.init.createSchema` | Needs a non-empty `database.schema` | `true` |
+| `database.init.cleanup` | Erase the admin credentials from the Secret the chart created | `true` |
+| `database.init.waitTimeout` | Seconds to wait for the server to accept connections | `300` |
+| `database.init.image.*` | Needs `psql` and `pg_isready` | `postgres:17-alpine` |
+| `database.init.kubectlImage.*` | Cleanup container only | `registry.k8s.io/kubectl:v1.34.0` |
+| `database.init.serviceAccount.create` | ServiceAccount, Role, and RoleBinding for the cleanup container | `true` |
+| `database.init.hooks.helm.weight` | Must be below `migrationJob.hooks.helm.weight` | `"-5"` |
+| `database.init.hooks.argocd.enabled`, `.syncWave` | | `false`, `"-5"` |
+| `database.init.backoffLimit`, `.ttlSecondsAfterFinished`, `.activeDeadlineSeconds` | | `4`, `120`, `900` |
+| `database.init.resources`, `.nodeSelector`, `.tolerations`, `.affinity` | | `{}` |
+| `database.init.podSecurityContext`, `.securityContext` | | `{}` |
+
 ### Redis
 
 | Key | Description | Default |
@@ -775,6 +891,11 @@ The chart fails the render, naming the value, rather than producing a workload t
 | `podLabels` setting a selector key | The Deployment selector is immutable; the apply would be rejected |
 | `pdb` with neither or both bounds | Ambiguous |
 | `autoscaling.minReplicas` above `maxReplicas` | Cannot be satisfied |
+| `database.init` with no admin credentials, or with two sources for them | Nothing to authenticate as, or ambiguity about which gets erased |
+| `database.init` under `awsIam` or `azureEntra` | The cloud issues the login, so there is no password to set on a role |
+| `database.init` with `existingSecret.urlKey` | A connection URL carries no separate user to create |
+| `database.init.createSchema` with an empty `database.schema` | Nothing to create |
+| `database.init` hook weight at or above the migration's | The migration would run before the database exists |
 
 ## Upgrading
 
@@ -836,7 +957,7 @@ The three CRD-based routing objects are skipped unless you pass `--schema-locati
 
 ## Not included
 
-- **A bundled PostgreSQL or Redis subchart.** See [Prerequisites](#prerequisites).
+- **A bundled PostgreSQL or Redis subchart.** See [Prerequisites](#prerequisites). `database.init` creates a database *on* a server you run; it does not run the server.
 - **The split gateway / backend / UI deployment** from the upstream `helm/litellm` chart. One Deployment keeps the baseline at one pod and avoids path-prefix dispatch that has to track the image's route allowlist. The templates carry `app.kubernetes.io/component` labels and per-component helpers, so the split can be added later without breaking any existing value path.
 - **KEDA autoscaling.** The HPA covers CPU and the two per-pod workload metrics.
 - **Enterprise billable-request metering.**

@@ -361,7 +361,75 @@
           }
         },
         "disablePreparedStatements": { "type": "boolean" },
-        "maxIdleConnectionLifetime": { "type": ["string", "integer"] }
+        "maxIdleConnectionLifetime": { "type": ["string", "integer"] },
+        "init": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "admin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "username": { "type": "string" },
+                "password": { "type": "string" },
+                "existingSecret": { "$ref": "#/definitions/secretUserRef" },
+                "database": { "type": "string", "minLength": 1 },
+                "sslMode": { "enum": ["", "disable", "prefer", "require", "verify-ca", "verify-full"] }
+              }
+            },
+            "createDatabase": { "type": "boolean" },
+            "createUser": { "type": "boolean" },
+            "createSchema": { "type": "boolean" },
+            "cleanup": { "type": "boolean" },
+            "waitTimeout": { "type": "integer", "minimum": 1 },
+            "image": { "$ref": "#/definitions/image" },
+            "kubectlImage": { "$ref": "#/definitions/image" },
+            "serviceAccount": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "create": { "type": "boolean" },
+                "name": { "type": "string" },
+                "annotations": { "$ref": "#/definitions/stringMap" }
+              }
+            },
+            "backoffLimit": { "type": "integer", "minimum": 0 },
+            "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
+            "activeDeadlineSeconds": { "type": ["integer", "null"], "minimum": 1 },
+            "annotations": { "$ref": "#/definitions/stringMap" },
+            "podAnnotations": { "$ref": "#/definitions/stringMap" },
+            "podSecurityContext": { "type": "object", "additionalProperties": true },
+            "securityContext": { "type": "object", "additionalProperties": true },
+            "resources": { "type": "object", "additionalProperties": true },
+            "nodeSelector": { "$ref": "#/definitions/stringMap" },
+            "tolerations": { "$ref": "#/definitions/objectArray" },
+            "affinity": { "type": "object", "additionalProperties": true },
+            "hooks": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "helm": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "weight": { "type": ["string", "integer"] }
+                  }
+                },
+                "argocd": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "syncWave": { "type": ["string", "integer"] }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
 
@@ -421,7 +489,10 @@
             "argocd": {
               "type": "object",
               "additionalProperties": false,
-              "properties": { "enabled": { "type": "boolean" } }
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "syncWave": { "type": ["string", "integer"] }
+              }
             }
           }
         }
@@ -486,6 +557,25 @@
         "passwordKey": { "type": "string" },
         "urlKey": { "type": "string" },
         "hostKey": { "type": "string" }
+      }
+    },
+    "secretUserRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "usernameKey": { "type": "string" },
+        "passwordKey": { "type": "string" }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
       }
     },
     "probe": {

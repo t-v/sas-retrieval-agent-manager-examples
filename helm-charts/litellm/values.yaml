@@ -363,7 +363,7 @@ database:
   port: 5432
   name: litellm
   # Postgres schema, when the proxy does not own the whole database.
-  schema: ""
+  schema: "litellm"
 
   # Appended to the assembled URL. `verify-full` with a root cert is the
   # setting a managed PostgreSQL service expects.
@@ -419,6 +419,122 @@ database:
   # them. The proxy defaults to 60.
   maxIdleConnectionLifetime: ""
 
+  # ─── Initialization ────────────────────────────────────────────────────────
+  # Optional one-shot Job that creates the database, the login role, and the
+  # schema on a PostgreSQL server that is running but empty. Off by default,
+  # because the usual case is a database a DBA already provisioned.
+  #
+  # The credentials in `database.existingSecret` above are the INPUT to this
+  # Job, not something it reads back: it creates a role with that username and
+  # password, owning `database.name` and `database.schema`. The proxy then
+  # authenticates as that role. One Secret, written once, used by both.
+  #
+  # Creating a database and a role needs an administrator. Those admin
+  # credentials are separate, are used only by this Job, and are erased from
+  # the cluster as soon as it succeeds. Ordering is enforced by Helm hook
+  # weight, so this Job completes before the migration Job and long before the
+  # proxy starts.
+  #
+  # Every statement is idempotent: an existing database, role, or schema is
+  # left in place and only the role's password is reset to match the Secret.
+  init:
+    enabled: false
+
+    admin:
+      # A user that may CREATE DATABASE and CREATE ROLE. On a managed service
+      # this is the server administrator, not a superuser.
+      #
+      # Inline values are rendered into a Secret that this chart creates and
+      # then empties once the Job succeeds.
+      #
+      # NOTE: an inline password is still recorded in the Helm release secret,
+      # which `helm get values` can read. To keep it out of the release
+      # entirely, create the Secret yourself and name it under
+      # `existingSecret` below.
+      username: ""
+      password: ""
+
+      # Read the admin credentials from a Secret you manage instead. The chart
+      # then creates no Secret of its own — and erases nothing, because it
+      # only destroys what it created. Rotating or deleting that Secret after
+      # the Job has run is yours to do.
+      existingSecret:
+        name: ""
+        usernameKey: username
+        passwordKey: password
+
+      # Database to connect to in order to issue CREATE DATABASE, which cannot
+      # run inside the database being created.
+      database: postgres
+
+      # Falls back to database.sslMode when empty.
+      sslMode: ""
+
+    # Each step is skipped when the object already exists.
+    createDatabase: true
+    createUser: true
+    # Needs a non-empty database.schema.
+    createSchema: true
+
+    # Erase the admin credentials from the cluster once the Job succeeds. The
+    # Job runs a second container that patches the `username` and `password`
+    # keys out of the Secret this chart created, so they no longer sit in the
+    # namespace for anything with `get secret` to read.
+    #
+    # This applies only to the Secret the chart created. With
+    # `admin.existingSecret` there is nothing of ours to erase and this does
+    # nothing, which is why the NOTES on install tell you which case you are in.
+    cleanup: true
+
+    # Seconds to wait for the server to accept connections before giving up.
+    waitTimeout: 300
+
+    # Needs psql and pg_isready. Any PostgreSQL client image will do.
+    image:
+      repository: postgres
+      tag: "17-alpine"
+      pullPolicy: IfNotPresent
+
+    # Used only by the cleanup container.
+    kubectlImage:
+      repository: registry.k8s.io/kubectl
+      tag: "v1.34.0"
+      pullPolicy: IfNotPresent
+
+    # The cleanup container needs `get` and `patch` on exactly one Secret. The
+    # chart creates a ServiceAccount, Role, and RoleBinding scoped to that one
+    # name. Set `create: false` and name your own to supply the RBAC yourself.
+    serviceAccount:
+      create: true
+      name: ""
+      annotations: {}
+
+    backoffLimit: 4
+    ttlSecondsAfterFinished: 120
+    # Wall-clock budget for the whole Job, shared across every retry.
+    activeDeadlineSeconds: 900
+
+    annotations: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
+    hooks:
+      # Runs ahead of the migration Job, which uses weight "1". Keep this
+      # weight below that one.
+      helm:
+        enabled: true
+        weight: "-5"
+      # Turn this on and the Helm hook off under a GitOps controller. The sync
+      # wave orders this Job ahead of the migration Job.
+      argocd:
+        enabled: false
+        syncWave: "-5"
+
 # ─── Redis ───────────────────────────────────────────────────────────────────
 # The proxy's coordination store: cross-pod tpm/rpm limits, spend tracking, and
 # the pod lock manager. Required for correct rate limiting above one replica.
@@ -469,6 +585,9 @@ migrationJob:
     # as a PreSync hook. Running both at once migrates twice.
     argocd:
       enabled: false
+      # Ordered after database.init.hooks.argocd.syncWave, so the database
+      # exists before the migration runs.
+      syncWave: "0"
 
 # ─── Scaling ─────────────────────────────────────────────────────────────────
 autoscaling:

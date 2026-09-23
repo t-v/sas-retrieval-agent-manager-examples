@@ -72,6 +72,41 @@ for kind in Ingress HTTPRoute HTTPProxy Route; do
     "The database flow render is missing a ${kind}."
 done
 
+echo "── Database initialization ───────────────────────────────────────────────"
+helm template litellm "$CHART_PATH" --namespace litellm \
+  --kube-version "$KUBE_VERSION" \
+  --set modelManagement.mode=database \
+  --set database.host=pg.example.com \
+  --set database.existingSecret.name=litellm-db \
+  --set database.init.enabled=true \
+  --set database.init.admin.username=postgres \
+  --set database.init.admin.password=adminpw \
+  >"$out/db-init.yaml"
+
+assert_present "^kind: Job$" "$out/db-init.yaml" \
+  "The initialization flow must render a Job."
+# The psql step has to be an init container: Kubernetes only starts ordinary
+# containers once init containers have exited 0, which is what stops the
+# cleanup step erasing the credentials after a failed initialization.
+assert_present "initContainers:" "$out/db-init.yaml" \
+  "The psql step must run as an init container, ahead of the cleanup container."
+assert_present '"data":{"username":null,"password":null}' "$out/db-init.yaml" \
+  "The cleanup step must erase the admin credentials with a merge patch."
+# The cleanup container runs the upstream distroless kubectl image, which has
+# no shell. A command starting /bin/sh would never run.
+assert_absent '/bin/sh", "/scripts/cleanup.sh' "$out/db-init.yaml" \
+  "The cleanup container must invoke kubectl directly; its image has no shell."
+# Scoped to the one Secret the chart created, and with no `delete` verb, so
+# this chart never creates a Role that could delete Secrets in the namespace.
+assert_present 'verbs: \["get", "patch"\]' "$out/db-init.yaml" \
+  "The initialization Role must grant only get and patch."
+assert_absent 'verbs:.*delete' "$out/db-init.yaml" \
+  "The initialization Role must not grant delete on Secrets."
+
+echo "── Initialization is off by default ──────────────────────────────────────"
+assert_absent "db-init" "$out/database.yaml" \
+  "The database flow must not render initialization objects unless asked."
+
 echo "── The proxy and the migration Job share one image tag ───────────────────"
 app_version="$(helm show chart "$CHART_PATH" | awk '/^appVersion:/ { gsub(/"/, "", $2); print $2 }')"
 tags="$(grep -E '^\s+image: ' "$out/database.yaml" | awk '{ print $2 }' | tr -d '"' | sort -u)"
