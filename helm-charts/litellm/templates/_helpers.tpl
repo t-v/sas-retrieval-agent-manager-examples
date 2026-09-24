@@ -121,6 +121,137 @@ default
 {{- if and (include "litellm.databaseEnabled" .) .Values.database.init.enabled -}}true{{- end -}}
 {{- end -}}
 
+{{/* Non-empty when the Keycloak bootstrap Job is rendered. */}}
+{{- define "litellm.keycloakBootstrapEnabled" -}}
+{{- if and .Values.sso.enabled .Values.sso.keycloakBootstrap.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/* ── Single sign-on ──────────────────────────────────────────────────── */}}
+
+{{/*
+The browser-facing base URL of this proxy.
+
+Derived from the routing block when not given, because every part of it is
+already stated there: whether TLS is on, the host, and the path the release is
+published under. Deriving it keeps the redirect URI from drifting out of step
+with the Ingress after someone edits one and forgets the other.
+*/}}
+{{- define "litellm.proxyBaseUrl" -}}
+{{- if .Values.sso.proxyBaseUrl -}}
+{{- .Values.sso.proxyBaseUrl | trimSuffix "/" -}}
+{{- else -}}
+{{- $scheme := ternary "https" "http" .Values.routing.tls.enabled -}}
+{{- $host := first .Values.routing.hosts -}}
+{{- $path := .Values.routing.path | default "/" | trimSuffix "/" -}}
+{{- printf "%s://%s%s" $scheme $host $path -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "litellm.sso.secretName" -}}
+{{- if .Values.sso.clientSecret.existingSecret.name -}}
+{{- .Values.sso.clientSecret.existingSecret.name -}}
+{{- else -}}
+{{- printf "%s-sso" (include "litellm.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "litellm.sso.secretKey" -}}
+{{- if .Values.sso.clientSecret.existingSecret.name -}}
+{{- default "client-secret" .Values.sso.clientSecret.existingSecret.key -}}
+{{- else -}}
+client-secret
+{{- end -}}
+{{- end -}}
+
+{{/* Non-empty when the chart owns the SSO Secret rather than referencing one. */}}
+{{- define "litellm.sso.ownsSecret" -}}
+{{- if not .Values.sso.clientSecret.existingSecret.name -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The bootstrap administrator's password Secret.
+
+Falls back to the chart's own SSO Secret, so the common case needs no second
+Secret and no extra values.
+*/}}
+{{- define "litellm.sso.adminUserSecretName" -}}
+{{- $u := .Values.sso.keycloakBootstrap.adminUser -}}
+{{- if $u.password.existingSecret.name -}}
+{{- $u.password.existingSecret.name -}}
+{{- else -}}
+{{- include "litellm.sso.secretName" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "litellm.sso.adminUserSecretKey" -}}
+{{- $u := .Values.sso.keycloakBootstrap.adminUser -}}
+{{- if $u.password.existingSecret.name -}}
+{{- default "password" $u.password.existingSecret.key -}}
+{{- else -}}
+admin-user-password
+{{- end -}}
+{{- end -}}
+
+{{- define "litellm.keycloakBootstrap.fullname" -}}
+{{- printf "%s-keycloak-bootstrap" (include "litellm.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "litellm.keycloakBootstrap.labels" -}}
+helm.sh/chart: {{ include "litellm.chart" . }}
+app.kubernetes.io/name: {{ include "litellm.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: keycloak-bootstrap
+{{- with .Chart.AppVersion }}
+app.kubernetes.io/version: {{ . | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Environment that turns on SSO.
+
+LiteLLM reads its generic OIDC provider entirely from the environment, so this
+is the whole integration.
+*/}}
+{{- define "litellm.ssoEnv" -}}
+{{- if .Values.sso.enabled }}
+- name: PROXY_BASE_URL
+  value: {{ include "litellm.proxyBaseUrl" . | quote }}
+- name: GENERIC_CLIENT_ID
+  value: {{ .Values.sso.clientId | quote }}
+- name: GENERIC_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "litellm.sso.secretName" . }}
+      key: {{ include "litellm.sso.secretKey" . }}
+- name: GENERIC_AUTHORIZATION_ENDPOINT
+  value: {{ required "sso.authorizationEndpoint is required when sso.enabled is true" .Values.sso.authorizationEndpoint | quote }}
+- name: GENERIC_TOKEN_ENDPOINT
+  value: {{ required "sso.tokenEndpoint is required when sso.enabled is true" .Values.sso.tokenEndpoint | quote }}
+- name: GENERIC_USERINFO_ENDPOINT
+  value: {{ required "sso.userinfoEndpoint is required when sso.enabled is true" .Values.sso.userinfoEndpoint | quote }}
+{{- with .Values.sso.scope }}
+- name: GENERIC_SCOPE
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.sso.clientState }}
+- name: GENERIC_CLIENT_STATE
+  value: {{ . | quote }}
+{{- end }}
+{{- if .Values.sso.usePkce }}
+- name: GENERIC_CLIENT_USE_PKCE
+  value: "true"
+{{- end }}
+{{- with .Values.sso.logoutUrl }}
+- name: PROXY_LOGOUT_URL
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
 {{/* ── Database initialization ─────────────────────────────────────────── */}}
 
 {{- define "litellm.dbInit.fullname" -}}
@@ -272,17 +403,29 @@ resource does not exist yet when a pre-install hook runs.
 Invoke with a dict: (dict "root" $ "weight" "-10").
 */}}
 {{- define "litellm.dbInit.hookAnnotations" -}}
-{{- $root := .root -}}
-{{- $init := $root.Values.database.init -}}
-{{- if $init.hooks.helm.enabled }}
+{{- include "litellm.hookAnnotations" (dict "hooks" .root.Values.database.init.hooks "weight" .weight) -}}
+{{- end -}}
+
+{{/*
+Generic hook annotations, driven by a `hooks` block of the shape every Job in
+this chart uses.
+
+Invoke with a dict: (dict "hooks" .Values.<thing>.hooks "weight" "-10").
+
+`weight` is passed separately so the objects a Job depends on can be ordered
+ahead of the Job itself while sharing one hooks configuration.
+*/}}
+{{- define "litellm.hookAnnotations" -}}
+{{- $hooks := .hooks -}}
+{{- if $hooks.helm.enabled }}
 helm.sh/hook: pre-install,pre-upgrade
 helm.sh/hook-delete-policy: before-hook-creation
 helm.sh/hook-weight: {{ .weight | quote }}
 {{- end }}
-{{- if $init.hooks.argocd.enabled }}
+{{- if $hooks.argocd.enabled }}
 argocd.argoproj.io/hook: PreSync
 argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
-argocd.argoproj.io/sync-wave: {{ $init.hooks.argocd.syncWave | quote }}
+argocd.argoproj.io/sync-wave: {{ $hooks.argocd.syncWave | quote }}
 {{- end }}
 {{- end -}}
 
@@ -522,6 +665,12 @@ own startup push, or N replicas race one database on every rollout.
   value: {{ .Values.listen | default "0.0.0.0" | quote }}
 - name: PORT
   value: {{ .Values.service.port | quote }}
+{{- with .Values.serverRootPath }}
+{{- /* Moves the UI and the API under a prefix. Health endpoints keep
+       answering at the root as well, so the probes are unaffected. */}}
+- name: SERVER_ROOT_PATH
+  value: {{ . | quote }}
+{{- end }}
 - name: PROXY_MASTER_KEY
   valueFrom:
     secretKeyRef:
@@ -548,6 +697,7 @@ own startup push, or N replicas race one database on every rollout.
 {{- end }}
 {{- include "litellm.databaseEnv" . }}
 {{- include "litellm.redisEnv" . }}
+{{- include "litellm.ssoEnv" . }}
 {{- if .Values.metricsServer.enabled }}
 - name: PROMETHEUS_METRICS_PORT
   value: {{ .Values.metricsServer.port | quote }}
@@ -670,6 +820,57 @@ the value; the same mistake found at runtime is an opaque CrashLoopBackOff.
 
 {{- if and .Values.metricsServer.enabled (eq (int .Values.metricsServer.port) (int .Values.service.port)) -}}
 {{- fail "metricsServer.port must differ from service.port" -}}
+{{- end -}}
+
+{{- with .Values.serverRootPath -}}
+{{- if not (hasPrefix "/" .) -}}
+{{- fail (printf "serverRootPath must start with \"/\", got %q" .) -}}
+{{- end -}}
+{{- if hasSuffix "/" . -}}
+{{- fail (printf "serverRootPath must not end with \"/\", got %q. LiteLLM joins it to route paths directly, so a trailing slash produces doubled separators." .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and .Values.serverRootPath (eq .Values.routing.path "/") -}}
+{{- if or .Values.routing.ingress.enabled .Values.routing.httpRoute.enabled .Values.routing.httpProxy.enabled .Values.routing.route.enabled -}}
+{{- fail (printf "serverRootPath is %q but routing.path is \"/\", so this release still claims the whole host. Set routing.path to %q as well — the point of serverRootPath is to leave the root to another application." .Values.serverRootPath .Values.serverRootPath) -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and .Values.serverRootPath .Values.routing.path (ne .Values.routing.path "/") -}}
+{{- if ne (.Values.routing.path | trimSuffix "/") .Values.serverRootPath -}}
+{{- fail (printf "routing.path (%q) and serverRootPath (%q) must match. The proxy only serves its UI under serverRootPath, so a different routing path publishes a prefix that returns 404." .Values.routing.path .Values.serverRootPath) -}}
+{{- end -}}
+{{- end -}}
+
+{{- if .Values.sso.enabled -}}
+{{- if not (or .Values.sso.proxyBaseUrl .Values.routing.hosts) -}}
+{{- fail "sso.enabled needs a browser-facing URL: set sso.proxyBaseUrl, or routing.hosts so the chart can derive it. The provider redirects back to <proxyBaseUrl>/sso/callback." -}}
+{{- end -}}
+{{- $base := include "litellm.proxyBaseUrl" . -}}
+{{- if not (or (hasPrefix "http://" $base) (hasPrefix "https://" $base)) -}}
+{{- fail (printf "sso.proxyBaseUrl must include the scheme, got %q. A provider rejects a redirect_uri without one." $base) -}}
+{{- end -}}
+{{- if .Values.sso.keycloakBootstrap.enabled -}}
+{{- $kb := .Values.sso.keycloakBootstrap -}}
+{{- if not $kb.admin.existingSecret.name -}}
+{{- fail "sso.keycloakBootstrap.admin.existingSecret.name is required. The Job authenticates to Keycloak as an administrator, and this chart reads those credentials from a Secret only." -}}
+{{- end -}}
+{{- $valid := list "proxy_admin" "proxy_admin_viewer" "internal_user" "internal_user_viewer" -}}
+{{- if not (has $kb.roles.admin $valid) -}}
+{{- fail (printf "sso.keycloakBootstrap.roles.admin must be one of %s, got %q. LiteLLM matches this value against its own role names; anything else is ignored and the user signs in with no privileges." (join ", " $valid) $kb.roles.admin) -}}
+{{- end -}}
+{{- if not (has $kb.roles.user $valid) -}}
+{{- fail (printf "sso.keycloakBootstrap.roles.user must be one of %s, got %q." (join ", " $valid) $kb.roles.user) -}}
+{{- end -}}
+{{- if eq $kb.groups.admin $kb.groups.user -}}
+{{- fail (printf "sso.keycloakBootstrap.groups.admin and .user must differ, both are %q. One group cannot carry two different LiteLLM roles." $kb.groups.admin) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and .Values.sso.keycloakBootstrap.enabled (not .Values.sso.enabled) -}}
+{{- fail "sso.keycloakBootstrap.enabled requires sso.enabled. The Job registers a client this release would not then use." -}}
 {{- end -}}
 
 {{- if has (include "litellm.imageTag" .) (list "latest" "main-latest") -}}

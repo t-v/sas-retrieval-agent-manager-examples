@@ -85,6 +85,22 @@ numWorkers: ""
 # Address the proxy binds to inside the pod.
 listen: "0.0.0.0"
 
+# Mount the whole proxy under a path prefix instead of the domain root, by
+# setting SERVER_ROOT_PATH. Empty means the root.
+#
+# Use this whenever the proxy shares a hostname with another application. At
+# the root, LiteLLM claims `/ui`, `/v1`, `/docs`, `/health`, and more, which is
+# an awkward neighbour for an application that owns the site. With
+# `/litellm`, the Admin UI moves to `/litellm/ui` and the API base becomes
+# `https://<host>/litellm/v1`, leaving every root path to the other
+# application.
+#
+# The proxy still answers its health endpoints at the root as well, so the
+# liveness and readiness probes are unaffected either way.
+#
+# Set `routing.path` to the same prefix; the chart checks that you did.
+serverRootPath: ""
+
 image:
   repository: ghcr.io/berriai/litellm
   # Leave empty. The tag then follows the chart's appVersion, which is the
@@ -198,6 +214,161 @@ ui:
     name: ""
     usernameKey: username
     passwordKey: password
+
+# ─── Single sign-on ──────────────────────────────────────────────────────────
+# Sign in to the Admin UI with an OpenID Connect provider instead of the shared
+# master key. Wired through LiteLLM's generic OIDC support, so any compliant
+# provider works; the optional bootstrap Job below automates the Keycloak side.
+#
+# NOTE: SSO is a LiteLLM enterprise feature. Since v1.76.0 it is free for up to
+# five users; beyond that it needs a licence in `license.existingSecret`.
+sso:
+  enabled: false
+
+  # Browser-facing base URL of this proxy, including the scheme, and including
+  # `serverRootPath` when one is set. The provider redirects back to
+  # `<proxyBaseUrl>/sso/callback`, so a wrong value here surfaces as the
+  # provider rejecting the redirect_uri.
+  #
+  # Left empty, the chart derives it from routing.hosts[0], routing.tls, and
+  # routing.path, which is right whenever this release publishes its own host.
+  proxyBaseUrl: ""
+
+  clientId: litellm
+  scope: "openid profile email"
+
+  # Some providers require a state parameter, and some require PKCE.
+  clientState: ""
+  usePkce: false
+
+  # Endpoints are named separately because they are not called by the same
+  # party. The browser is redirected to `authorizationEndpoint`, so it must be
+  # the provider's public address. `tokenEndpoint` and `userinfoEndpoint` are
+  # called by the proxy pod, so they may be a cluster-internal address.
+  #
+  # Those two are frequently NOT interchangeable. A provider published through
+  # a cloud load balancer is often unreachable from inside the same cluster
+  # (hairpin NAT), while still advertising its public URL in its discovery
+  # document. Splitting them is what makes that deployment work.
+  authorizationEndpoint: ""
+  tokenEndpoint: ""
+  userinfoEndpoint: ""
+
+  # Where the provider sends the browser after sign-out. Empty leaves the
+  # proxy's own default.
+  logoutUrl: ""
+
+  clientSecret:
+    # Generated on first install when empty, then reused from the Secret on
+    # every later upgrade, so an upgrade never invalidates the provider-side
+    # registration.
+    value: ""
+    # Use a Secret you manage instead. The chart then renders none of its own
+    # and the bootstrap Job reads the client secret from here.
+    existingSecret:
+      name: ""
+      key: client-secret
+
+  # ─── Keycloak bootstrap ────────────────────────────────────────────────────
+  # One-shot Job that makes the Keycloak side match the settings above: an OIDC
+  # client with the right redirect URI, two client roles carrying LiteLLM's own
+  # role names, two groups mapped to those roles, a protocol mapper that puts
+  # the roles where LiteLLM looks for them, and optionally a break-glass
+  # administrator account.
+  #
+  # Every step reads before it writes, so the Job is safe to re-run and safe to
+  # point at a realm that another application already owns: it only ever
+  # touches objects it is named to manage.
+  keycloakBootstrap:
+    enabled: false
+
+    # Admin API base URL, as reachable from inside the cluster. This is the
+    # base of the Keycloak deployment, not a realm URL — for example
+    # `http://keycloak.identity.svc.cluster.local:8080` or, when Keycloak runs
+    # under a path, `http://keycloak:8080/auth`.
+    url: ""
+    realm: ""
+
+    # A Keycloak account that may administer `realm` — normally the `master`
+    # realm admin. Used only by this Job.
+    admin:
+      existingSecret:
+        name: ""
+        usernameKey: username
+        passwordKey: password
+      # Realm to authenticate the admin account against.
+      realm: master
+
+    # Client roles created on the LiteLLM client, and the groups granted them.
+    #
+    # The role VALUES have to be names LiteLLM recognises: proxy_admin,
+    # proxy_admin_viewer, internal_user, or internal_user_viewer. The group
+    # names are yours.
+    #
+    # Client roles rather than realm roles, so nothing this chart creates
+    # appears at realm scope or collides with another application's names.
+    roles:
+      admin: proxy_admin
+      user: internal_user
+    groups:
+      admin: litellm-admins
+      user: litellm-users
+
+    # A named administrator, so the first sign-in does not need the master key
+    # and so there is a way in that does not depend on a person's directory
+    # account. Put real users in the admin group instead of sharing this one.
+    adminUser:
+      enabled: true
+      username: llmadmin
+      email: ""
+      firstName: LiteLLM
+      lastName: Administrator
+      password:
+        # Generated on first install when empty, then reused.
+        value: ""
+        existingSecret:
+          name: ""
+          key: password
+      # Leave true so the account is usable immediately. Set false to force a
+      # password change at first sign-in, which needs a reachable account
+      # console.
+      permanentPassword: true
+
+    # Extra redirect URIs, beyond `<proxyBaseUrl>/sso/callback` and the
+    # `/sso/debug/callback` route LiteLLM uses to dump received claims.
+    extraRedirectUris: []
+
+    # Needs kcadm.sh. Keep this on the same minor version as the server.
+    image:
+      repository: quay.io/keycloak/keycloak
+      tag: "26.3.2"
+      pullPolicy: IfNotPresent
+
+    # Seconds to wait for Keycloak to answer before giving up.
+    waitTimeout: 300
+
+    backoffLimit: 4
+    ttlSecondsAfterFinished: 120
+    activeDeadlineSeconds: 900
+
+    annotations: {}
+    podAnnotations: {}
+    podSecurityContext: {}
+    securityContext: {}
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
+    hooks:
+      # Runs after the database is ready but before the proxy starts, so the
+      # provider is configured by the time anyone can reach the UI.
+      helm:
+        enabled: true
+        weight: "2"
+      argocd:
+        enabled: false
+        syncWave: "2"
 
 # ─── Service ─────────────────────────────────────────────────────────────────
 service:

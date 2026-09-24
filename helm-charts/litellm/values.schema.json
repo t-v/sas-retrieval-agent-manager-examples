@@ -63,6 +63,7 @@
     "replicaCount": { "type": "integer", "minimum": 0 },
     "numWorkers": { "type": ["string", "integer"] },
     "listen": { "type": "string" },
+    "serverRootPath": { "type": "string", "pattern": "^(|/[^/].*[^/]|/[^/])$" },
 
     "image": {
       "type": "object",
@@ -142,6 +143,122 @@
             "name": { "type": "string" },
             "usernameKey": { "type": "string" },
             "passwordKey": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "sso": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "proxyBaseUrl": { "type": "string" },
+        "clientId": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string" },
+        "clientState": { "type": "string" },
+        "usePkce": { "type": "boolean" },
+        "authorizationEndpoint": { "type": "string" },
+        "tokenEndpoint": { "type": "string" },
+        "userinfoEndpoint": { "type": "string" },
+        "logoutUrl": { "type": "string" },
+        "clientSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "value": { "type": "string" },
+            "existingSecret": { "$ref": "#/definitions/secretRef" }
+          }
+        },
+        "keycloakBootstrap": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "url": { "type": "string" },
+            "realm": { "type": "string" },
+            "admin": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": { "$ref": "#/definitions/secretUserRef" },
+                "realm": { "type": "string" }
+              }
+            },
+            "roles": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "admin": { "enum": ["proxy_admin", "proxy_admin_viewer", "internal_user", "internal_user_viewer"] },
+                "user": { "enum": ["proxy_admin", "proxy_admin_viewer", "internal_user", "internal_user_viewer"] }
+              }
+            },
+            "groups": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "admin": { "type": "string", "minLength": 1 },
+                "user": { "type": "string", "minLength": 1 }
+              }
+            },
+            "adminUser": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "username": { "type": "string", "minLength": 1 },
+                "email": { "type": "string" },
+                "firstName": { "type": "string" },
+                "lastName": { "type": "string" },
+                "permanentPassword": { "type": "boolean" },
+                "password": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "value": { "type": "string" },
+                    "existingSecret": { "$ref": "#/definitions/secretRef" }
+                  }
+                }
+              }
+            },
+            "extraRedirectUris": { "type": "array", "items": { "type": "string" } },
+            "image": { "$ref": "#/definitions/image" },
+            "waitTimeout": { "type": "integer", "minimum": 1 },
+            "backoffLimit": { "type": "integer", "minimum": 0 },
+            "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
+            "activeDeadlineSeconds": { "type": ["integer", "null"], "minimum": 1 },
+            "annotations": { "$ref": "#/definitions/stringMap" },
+            "podAnnotations": { "$ref": "#/definitions/stringMap" },
+            "podSecurityContext": { "type": "object", "additionalProperties": true },
+            "securityContext": { "type": "object", "additionalProperties": true },
+            "resources": { "type": "object", "additionalProperties": true },
+            "nodeSelector": { "$ref": "#/definitions/stringMap" },
+            "tolerations": { "$ref": "#/definitions/objectArray" },
+            "affinity": { "type": "object", "additionalProperties": true },
+            "hooks": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "helm": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "weight": { "type": ["string", "integer"] }
+                  }
+                },
+                "argocd": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "syncWave": { "type": ["string", "integer"] }
+                  }
+                }
+              }
+            }
           }
         }
       }
