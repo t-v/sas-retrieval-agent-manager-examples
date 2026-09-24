@@ -266,9 +266,19 @@ data:
     # can read. Without this, rotating the Secret would leave an account whose
     # password nobody knows.
     log "Setting the password for '${LITELLM_ADMIN_USERNAME}' ..."
-    "$KC" set-password -r "$REALM" --config "$CFG" --userid "$user_id" \
-      --new-password "$(cat /secret/sso/admin-user-password)" \
-      {{ if $kb.adminUser.permanentPassword }}--temporary=false{{ else }}--temporary{{ end }}
+    if ! "$KC" set-password -r "$REALM" --config "$CFG" --userid "$user_id" \
+           --new-password "$(cat /secret/sso/admin-user-password)" \
+           {{ if $kb.adminUser.permanentPassword }}--temporary=false{{ else }}--temporary{{ end }}; then
+      # Realms very often carry a password policy, and Keycloak reports only
+      # the first rule that was broken. Naming the setting to change saves
+      # working back from the message to the values file.
+      log "ERROR: Keycloak rejected the password for '${LITELLM_ADMIN_USERNAME}' (see the message above)."
+      log "       The realm's password policy is stricter than the value in use."
+      log "       Inspect it with:"
+      log "         kcadm.sh get realms/${REALM} --fields passwordPolicy"
+      log "       Then set a conforming value in sso.keycloakBootstrap.adminUser.password."
+      exit 1
+    fi
 
     # Adding a user to a group they already belong to returns 204, so this
     # needs no existence check of its own.

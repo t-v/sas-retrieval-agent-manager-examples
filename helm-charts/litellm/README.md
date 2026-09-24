@@ -23,6 +23,8 @@ More than one may be enabled at a time, which is how you move from Ingress to Ga
 - [Model management](#model-management)
 - [Provider credentials](#provider-credentials)
 - [Routing](#routing)
+- [Sharing a hostname](#sharing-a-hostname)
+- [Single sign-on](#single-sign-on)
 - [Database](#database)
 - [Creating the database](#creating-the-database)
 - [Redis](#redis)
@@ -332,6 +334,98 @@ routing:
 ```
 
 Both objects point at the same Service, so neither takes the proxy down.
+
+## Sharing a hostname
+
+At the domain root LiteLLM claims `/ui`, `/v1`, `/docs`, `/health`, `/metrics` and more. That is an awkward neighbour for an application that owns the site, and it is the usual reason to deploy this chart as an add-on rather than as the main tenant.
+
+`serverRootPath` moves the whole proxy under a prefix:
+
+```yaml
+serverRootPath: /litellm
+routing:
+  path: /litellm
+```
+
+The Admin UI is then at `/litellm/ui` and the OpenAI-compatible base URL becomes `https://<host>/litellm/v1`. Nothing outside the prefix is served, so every root path stays available to the other application.
+
+> [!NOTE]
+> The health endpoints keep answering at the **root** as well, which is why the probes in this chart are not prefixed. Verified against the image: with `SERVER_ROOT_PATH` set, `/health/readiness` and `/litellm/health/readiness` both return 200 while `/ui` returns 404 and `/litellm/ui` returns 200. The UI's own asset URLs are rewritten by the image at runtime.
+
+The chart fails the render if `routing.path` does not match the prefix, because publishing `/` anyway would defeat the point, and publishing a *different* prefix would serve 404s.
+
+This changes the client-facing API base URL, so existing callers need updating.
+
+## Single sign-on
+
+Signs in to the Admin UI with an OpenID Connect provider instead of the shared master key, through LiteLLM's generic OIDC support.
+
+> [!IMPORTANT]
+> SSO is a LiteLLM **enterprise** feature. Since v1.76.0 it is free for up to five users; past that it needs a licence in `license.existingSecret`.
+
+```yaml
+sso:
+  enabled: true
+  clientId: litellm
+  authorizationEndpoint: https://idp.example.com/realms/r/protocol/openid-connect/auth
+  tokenEndpoint: https://idp.example.com/realms/r/protocol/openid-connect/token
+  userinfoEndpoint: https://idp.example.com/realms/r/protocol/openid-connect/userinfo
+```
+
+The client secret is generated on first install and reused on every later upgrade, so upgrading never invalidates the provider-side registration. Supply your own with `sso.clientSecret.existingSecret`.
+
+`sso.proxyBaseUrl` is derived from `routing.hosts[0]`, `routing.tls.enabled` and `routing.path` when left empty, including any `serverRootPath` prefix. Deriving it keeps the redirect URI from drifting out of step with the Ingress. The provider must accept `<proxyBaseUrl>/sso/callback`.
+
+### Why the three endpoints are separate
+
+They are not called by the same party, and they are frequently not interchangeable.
+
+| Setting | Called by | Must be reachable from |
+| --- | --- | --- |
+| `authorizationEndpoint` | the browser | the user's machine |
+| `tokenEndpoint` | the proxy pod | inside the cluster |
+| `userinfoEndpoint` | the proxy pod | inside the cluster |
+
+A provider published through a cloud load balancer is often unreachable from inside the same cluster, because the load balancer does not hairpin — yet it still advertises its public URL in its discovery document. Copying all three from that document produces a sign-in that redirects correctly and then fails at the token exchange. Point the browser-facing one at the public address and the other two at the in-cluster Service.
+
+### Keycloak bootstrap
+
+`sso.keycloakBootstrap` adds a one-shot Job that configures the Keycloak side to match:
+
+```yaml
+sso:
+  keycloakBootstrap:
+    enabled: true
+    url: http://keycloak.identity.svc.cluster.local:8080
+    realm: myrealm
+    admin:
+      existingSecret:
+        name: keycloak-admin     # keys: username, password
+```
+
+It creates, in an existing realm:
+
+1. A confidential OIDC client with the right redirect URIs, including LiteLLM's `/sso/debug/callback` claim-dumping route.
+2. Two **client** roles carrying LiteLLM's own role names — `proxy_admin` and `internal_user` by default.
+3. Two groups, `litellm-admins` and `litellm-users`, granted those roles.
+4. A protocol mapper putting the client roles into a flat `roles` claim.
+5. Optionally an `llmadmin` account in the admin group.
+
+Step 4 is the one that is easy to miss. Keycloak nests client roles under `resource_access.<client>.roles`, which LiteLLM does not read, so without the mapper every user signs in carrying no role at all.
+
+Client roles rather than realm roles, and dedicated groups rather than existing ones, so nothing this chart creates appears at realm scope or changes another application's authorization. Point `groups` at existing group names if you would rather reuse them.
+
+Every step reads before it writes, so the Job is safe to re-run and repairs a half-applied earlier run rather than duplicating it. It never creates realms.
+
+> [!WARNING]
+> Realms usually carry a password policy. The generated `llmadmin` password ends in a fixed `Aa1!` so it satisfies the common `upperCase(1) lowerCase(1) digits(1) specialChars(1)` rules by construction — relying on chance would fail roughly one deploy in four hundred. If your policy is stricter, set `sso.keycloakBootstrap.adminUser.password.value`; the Job names the policy in its error output when Keycloak rejects one.
+
+Read the account password with:
+
+```sh
+kubectl -n litellm get secret litellm-sso \
+  -o jsonpath='{.data.admin-user-password}' | base64 -d
+```
 
 ## Database
 
@@ -710,6 +804,7 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `replicaCount` | Proxy replicas, ignored when autoscaling is on | `1` |
 | `numWorkers` | Passed as `--num_workers`; empty lets the image decide | `""` |
 | `listen` | Bind address inside the pod | `0.0.0.0` |
+| `serverRootPath` | Mount the proxy under a prefix instead of the root | `""` |
 | `image.repository` | Proxy image | `ghcr.io/berriai/litellm` |
 | `image.tag` | Empty follows `appVersion` | `""` |
 | `image.pullPolicy` | | `IfNotPresent` |
@@ -787,6 +882,36 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `routing.route.tls.termination` | `edge`, `reencrypt`, or `passthrough` | `edge` |
 | `routing.route.tls.insecureEdgeTerminationPolicy` | | `Redirect` |
 | `routing.route.wildcardPolicy` | | `None` |
+
+### Single sign-on
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `sso.enabled` | Sign in to the Admin UI with OIDC. Enterprise; free to five users | `false` |
+| `sso.proxyBaseUrl` | Browser-facing URL; derived from `routing` when empty | `""` |
+| `sso.clientId` | | `litellm` |
+| `sso.scope` | | `openid profile email` |
+| `sso.clientState`, `.usePkce` | Required by some providers | `""`, `false` |
+| `sso.authorizationEndpoint` | Browser-facing; must be publicly reachable | `""` |
+| `sso.tokenEndpoint`, `.userinfoEndpoint` | Called by the pod; may be in-cluster | `""` |
+| `sso.logoutUrl` | | `""` |
+| `sso.clientSecret.value` | Generated on first install when empty | `""` |
+| `sso.clientSecret.existingSecret.name` | Use a Secret you manage | `""` |
+| `sso.keycloakBootstrap.enabled` | Configure the Keycloak side automatically | `false` |
+| `sso.keycloakBootstrap.url` | Admin API base URL, reachable in-cluster | `""` |
+| `sso.keycloakBootstrap.realm` | Must already exist; the Job creates no realms | `""` |
+| `sso.keycloakBootstrap.admin.existingSecret.name` | Required. Keycloak administrator | `""` |
+| `sso.keycloakBootstrap.admin.realm` | Realm holding the admin account | `master` |
+| `sso.keycloakBootstrap.roles.admin`, `.user` | Must be names LiteLLM recognises | `proxy_admin`, `internal_user` |
+| `sso.keycloakBootstrap.groups.admin`, `.user` | Groups granted those roles | `litellm-admins`, `litellm-users` |
+| `sso.keycloakBootstrap.adminUser.enabled` | Create a named administrator account | `true` |
+| `sso.keycloakBootstrap.adminUser.username` | | `llmadmin` |
+| `sso.keycloakBootstrap.adminUser.password.value` | Generated when empty | `""` |
+| `sso.keycloakBootstrap.adminUser.permanentPassword` | False forces a change at first sign-in | `true` |
+| `sso.keycloakBootstrap.extraRedirectUris` | Beyond the two the chart registers | `[]` |
+| `sso.keycloakBootstrap.image.*` | Needs `kcadm.sh`; match the server's minor version | `quay.io/keycloak/keycloak:26.3.2` |
+| `sso.keycloakBootstrap.waitTimeout` | Seconds to wait for Keycloak | `300` |
+| `sso.keycloakBootstrap.hooks.helm.weight` | Runs after the database Jobs | `"2"` |
 
 ### Database
 
@@ -896,6 +1021,14 @@ The chart fails the render, naming the value, rather than producing a workload t
 | `database.init` with `existingSecret.urlKey` | A connection URL carries no separate user to create |
 | `database.init.createSchema` with an empty `database.schema` | Nothing to create |
 | `database.init` hook weight at or above the migration's | The migration would run before the database exists |
+| `serverRootPath` with `routing.path: /` | The release would still claim the whole host |
+| `serverRootPath` and `routing.path` disagreeing | The published prefix would return 404 |
+| `sso.enabled` with no host and no `proxyBaseUrl` | There is no redirect URI to register |
+| `sso.proxyBaseUrl` without a scheme | Providers reject such a `redirect_uri` |
+| `keycloakBootstrap` with no admin Secret | Nothing to authenticate to Keycloak as |
+| `keycloakBootstrap` roles outside LiteLLM's own set | The role is ignored and users get no privileges |
+| `keycloakBootstrap` admin and user groups the same | One group cannot carry two roles |
+| `keycloakBootstrap` without `sso.enabled` | It would register a client nothing uses |
 
 ## Upgrading
 
