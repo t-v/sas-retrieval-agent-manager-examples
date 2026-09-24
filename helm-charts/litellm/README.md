@@ -229,6 +229,26 @@ Shared settings live under `routing`; each implementation adds its own block. `r
 
 The proxy serves the OpenAI API, the management API, and the UI from one port, so a single path prefix covers everything and no path-based dispatch is needed.
 
+`routing.path` defaults to `/litellm` and must match `serverRootPath`, which is the prefix the proxy actually serves under — see [Sharing a hostname](#sharing-a-hostname).
+
+### Forwarded headers
+
+TLS terminates at the ingress, so the request arriving at the pod is plaintext. Left to itself the proxy takes that at face value and emits `http://` URLs — the trailing-slash redirect on `/ui` sends the browser to a plaintext address, downgrading a release this chart published over HTTPS.
+
+uvicorn already parses the `X-Forwarded-*` headers that say otherwise, but ignores them unless the sender is trusted, and its default is `127.0.0.1` — which in Kubernetes is never the ingress. `trustedProxies` supplies that list, and defaults to `*`:
+
+```yaml
+trustedProxies: ["*"]
+```
+
+`*` trusts any client that can reach the pod. The Service is ClusterIP, so that means in-cluster callers rather than the internet, and the only header they could forge is consulted for the client IP in logs and for LiteLLM's optional `allowed_ips`. On a cluster without NetworkPolicy, narrow it to whatever fronts the release:
+
+```yaml
+trustedProxies: ["10.244.0.0/16"]   # pod CIDR
+```
+
+CIDR notation needs uvicorn 0.30 or newer, which the chart's pinned image carries. Setting `trustedProxies: []` leaves the variable unset and restores uvicorn's own default.
+
 ### Ingress
 
 ```yaml
@@ -299,6 +319,55 @@ Prefer this over a plain Ingress on Contour. The retry policy, response timeout,
 
 One HTTPProxy carries one virtual host. The chart fails the render rather than silently publishing only the first entry when `routing.hosts` has more than one.
 
+#### Sharing a hostname another release already owns
+
+Contour allows one **root** HTTPProxy per FQDN, and a root is any proxy that declares a `virtualhost`. When another application already owns the hostname this release has to answer on, a second root is rejected — and it is undefined which of the two loses, so the attempt risks taking the incumbent down.
+
+The way through is delegation: that application includes this one under a path prefix, and this release renders a **child** proxy with no `virtualhost` of its own.
+
+In the owning release's root HTTPProxy:
+
+```yaml
+includes:
+  - name: litellm
+    namespace: litellm
+    conditions:
+      - prefix: /litellm
+```
+
+And here:
+
+```yaml
+serverRootPath: /litellm      # must match the delegated prefix
+routing:
+  path: /litellm
+  httpProxy:
+    enabled: true
+    delegated: true
+```
+
+`routing.hosts` and `routing.tls` are not needed and are ignored: the child inherits both from the parent, so it needs no certificate of its own. TLS passthrough is rejected, since it is a property of a virtualhost the child does not have.
+
+The generated route matches `/`, not `routing.path`. Contour concatenates the parent's condition with the child's, so repeating the prefix would publish `/litellm/litellm`. `serverRootPath` must still match the delegated prefix, because that is what the proxy itself serves under.
+
+> [!IMPORTANT]
+> A child is reachable only while the parent includes it. Delete or reconfigure the parent and Contour reports the child as **orphaned** and ignores it — the release keeps running and serves nothing. `kubectl get httpproxy <name> -o jsonpath='{.status.description}'` is what tells you.
+
+Delegation also makes the mount root useful. The proxy answers its own root with a plain `"LiteLLM: RUNNING"` string, so a browser opening `/litellm` lands on nothing helpful; `requestRedirectPolicy` on an exact match sends it to the Admin UI instead:
+
+```yaml
+routing:
+  httpProxy:
+    extraRoutes:
+      - conditions:
+          - exact: /
+        requestRedirectPolicy:
+          path: /litellm/ui/
+          statusCode: 302
+```
+
+An exact match is what keeps this to the bare prefix — a `prefix` condition would redirect `/litellm/v1/...` as well. This works for a root HTTPProxy too; it is only unavailable on a plain Ingress, where Contour ignores the redirect annotations.
+
 ### Route (OpenShift)
 
 ```yaml
@@ -339,7 +408,7 @@ Both objects point at the same Service, so neither takes the proxy down.
 
 At the domain root LiteLLM claims `/ui`, `/v1`, `/docs`, `/health`, `/metrics` and more. That is an awkward neighbour for an application that owns the site, and it is the usual reason to deploy this chart as an add-on rather than as the main tenant.
 
-`serverRootPath` moves the whole proxy under a prefix:
+**The chart therefore ships mounted under `/litellm`**, via `serverRootPath`:
 
 ```yaml
 serverRootPath: /litellm
@@ -347,7 +416,38 @@ routing:
   path: /litellm
 ```
 
-The Admin UI is then at `/litellm/ui` and the OpenAI-compatible base URL becomes `https://<host>/litellm/v1`. Nothing outside the prefix is served, so every root path stays available to the other application.
+The Admin UI is at `/litellm/ui` and the OpenAI-compatible base URL is `https://<host>/litellm/v1`. Nothing outside the prefix is served, so every root path stays available to the other application.
+
+To claim the domain root instead, clear both:
+
+```yaml
+serverRootPath: ""
+routing:
+  path: /
+```
+
+> [!IMPORTANT]
+> Point clients at the prefix. With the default, `OPENAI_BASE_URL` is `https://<host>/litellm/v1`; a client configured for `https://<host>/v1` gets a 404 from the proxy rather than a connection error, which tends to read as a missing model.
+
+### API docs
+
+LiteLLM serves the Swagger UI at its **mount root** — upstream's `DOCS_URL` defaults to `/` — so opening the release in a browser lands on the API reference rather than the Admin UI. This chart moves it to `/docs`:
+
+```yaml
+docs:
+  enabled: true
+  path: /docs
+```
+
+| | URL with the chart defaults |
+| --- | --- |
+| Swagger UI | `https://<host>/litellm/docs` |
+| Admin UI | `https://<host>/litellm/ui` |
+
+Set `path: /` to restore upstream's behaviour, or `enabled: false` to drop the docs page and the OpenAPI schema together — both, because Swagger reads the schema, and removing one without the other leaves a page that renders an error. A path under `/ui` fails the render, since it would be shadowed by the Admin UI.
+
+> [!NOTE]
+> With the docs moved, the mount root itself returns LiteLLM's plain `"LiteLLM: RUNNING"` health string. The proxy has no route that redirects its root to the Admin UI, so link people to `/litellm/ui` directly.
 
 > [!NOTE]
 > The health endpoints keep answering at the **root** as well, which is why the probes in this chart are not prefixed. Verified against the image: with `SERVER_ROOT_PATH` set, `/health/readiness` and `/litellm/health/readiness` both return 200 while `/ui` returns 404 and `/litellm/ui` returns 200. The UI's own asset URLs are rewritten by the image at runtime.
@@ -804,7 +904,10 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `replicaCount` | Proxy replicas, ignored when autoscaling is on | `1` |
 | `numWorkers` | Passed as `--num_workers`; empty lets the image decide | `""` |
 | `listen` | Bind address inside the pod | `0.0.0.0` |
-| `serverRootPath` | Mount the proxy under a prefix instead of the root | `""` |
+| `serverRootPath` | Prefix the proxy is mounted under; `""` claims the root | `/litellm` |
+| `trustedProxies` | Senders whose `X-Forwarded-*` headers are believed | `["*"]` |
+| `docs.enabled` | Serve the Swagger UI and the OpenAPI schema | `true` |
+| `docs.path` | Path for the Swagger UI; `/` is upstream's mount root | `/docs` |
 | `image.repository` | Proxy image | `ghcr.io/berriai/litellm` |
 | `image.tag` | Empty follows `appVersion` | `""` |
 | `image.pullPolicy` | | `IfNotPresent` |
@@ -861,7 +964,7 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | Key | Description | Default |
 | --- | --- | --- |
 | `routing.hosts` | Hostnames; required for `ingress` and `httpProxy` | `[]` |
-| `routing.path` | Path prefix the proxy is published under | `/` |
+| `routing.path` | Published prefix; must match `serverRootPath` | `/litellm` |
 | `routing.tls.enabled` | | `false` |
 | `routing.tls.secretName` | `kubernetes.io/tls` Secret | `""` |
 | `routing.annotations`, `routing.labels` | Merged into every routing object | `{}` |
@@ -874,6 +977,7 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `routing.httpRoute.matches`, `.filters`, `.timeouts` | Passed through | `[]`, `[]`, `{}` |
 | `routing.httpRoute.extraRules` | Appended after the generated rule | `[]` |
 | `routing.httpProxy.enabled` | | `false` |
+| `routing.httpProxy.delegated` | Render a child proxy for a parent that includes it | `false` |
 | `routing.httpProxy.ingressClassName` | | `""` |
 | `routing.httpProxy.tls.*` | Falls back to `routing.tls.secretName` | see values.yaml |
 | `routing.httpProxy.timeoutPolicy`, `.retryPolicy`, `.loadBalancerPolicy` | Contour policies | `{}` |

@@ -671,6 +671,24 @@ own startup push, or N replicas race one database on every rollout.
 - name: SERVER_ROOT_PATH
   value: {{ . | quote }}
 {{- end }}
+{{- if and .Values.trustedProxies (not (hasKey (default dict .Values.envVars) "FORWARDED_ALLOW_IPS")) }}
+{{- /* Without this the pod sees plaintext from the ingress and emits http://
+       redirects. Rendered ahead of envVars so an explicit entry there wins. */}}
+- name: FORWARDED_ALLOW_IPS
+  value: {{ join "," .Values.trustedProxies | quote }}
+{{- end }}
+{{- if not .Values.docs.enabled }}
+{{- /* Drops the Swagger page and the schema it reads. */}}
+- name: NO_DOCS
+  value: "True"
+- name: NO_OPENAPI
+  value: "True"
+{{- else if .Values.docs.path }}
+{{- /* Upstream defaults this to "/", which puts Swagger on the mount root and
+       hides the Admin UI behind a path nobody guesses. */}}
+- name: DOCS_URL
+  value: {{ .Values.docs.path | quote }}
+{{- end }}
 - name: PROXY_MASTER_KEY
   valueFrom:
     secretKeyRef:
@@ -822,6 +840,12 @@ the value; the same mistake found at runtime is an opaque CrashLoopBackOff.
 {{- fail "metricsServer.port must differ from service.port" -}}
 {{- end -}}
 
+{{- if and .Values.docs.enabled .Values.docs.path -}}
+{{- if hasPrefix "/ui" .Values.docs.path -}}
+{{- fail (printf "docs.path %q would be served under the Admin UI's own path. Pick a path outside /ui, such as /docs." .Values.docs.path) -}}
+{{- end -}}
+{{- end -}}
+
 {{- with .Values.serverRootPath -}}
 {{- if not (hasPrefix "/" .) -}}
 {{- fail (printf "serverRootPath must start with \"/\", got %q" .) -}}
@@ -909,9 +933,20 @@ the value; the same mistake found at runtime is an opaque CrashLoopBackOff.
 {{- end -}}
 {{- end -}}
 
-{{- if .Values.routing.httpProxy.enabled -}}
+{{- if and .Values.routing.httpProxy.enabled .Values.routing.httpProxy.delegated -}}
+{{- /*
+  A child carries no virtualhost, so passthrough — which is a property of one —
+  cannot be honoured. Silently dropping it would leave TLS terminating at the
+  parent when the operator asked for it not to.
+*/ -}}
+{{- if .Values.routing.httpProxy.tls.passthrough -}}
+{{- fail "routing.httpProxy.tls.passthrough cannot be combined with routing.httpProxy.delegated. TLS passthrough is a property of the virtualhost, and a delegated child has none: it inherits the parent's. Publish a root HTTPProxy instead, or drop passthrough." -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and .Values.routing.httpProxy.enabled (not .Values.routing.httpProxy.delegated) -}}
 {{- if not .Values.routing.hosts -}}
-{{- fail "routing.hosts is required when routing.httpProxy.enabled is true" -}}
+{{- fail "routing.hosts is required when routing.httpProxy.enabled is true. Set routing.httpProxy.delegated when another release owns the hostname and includes this one." -}}
 {{- end -}}
 {{- if gt (len .Values.routing.hosts) 1 -}}
 {{- fail "routing.httpProxy supports one virtual host. Set a single entry in routing.hosts, or render one release per host." -}}

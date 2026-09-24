@@ -63,8 +63,24 @@ Reach the proxy:
              Check it was accepted: kubectl -n {{ .Release.Namespace }} get httproute {{ include "litellm.fullname" . }} -o jsonpath='{.status.parents[*].conditions[?(@.type=="Accepted")].status}'
 {{- end }}
 {{- if .Values.routing.httpProxy.enabled }}
+  {{- if .Values.routing.httpProxy.delegated }}
+  {{- if not .Values.routing.httpProxy.ingressClassName }}
+
+  WARNING: routing.httpProxy.ingressClassName is empty. If Contour runs with
+           --ingress-class-name (the common case) it will ignore this proxy
+           silently, and the delegating parent will report IncludeNotFound as
+           though it did not exist. Set it to the controller's class.
+  {{- end }}
+  HTTPProxy: delegated. This release publishes nothing on its own: it is a child
+             proxy, reachable only while another release's root HTTPProxy
+             includes it under {{ .Values.routing.path }}.
+             Confirm the parent adopted it (an un-included child reports
+             "orphaned" and serves no traffic):
+               kubectl -n {{ .Release.Namespace }} get httpproxy {{ include "litellm.fullname" . }} -o jsonpath='{.status.description}'
+  {{- else }}
   HTTPProxy: {{ first .Values.routing.hosts }}
              Check it is valid: kubectl -n {{ .Release.Namespace }} get httpproxy {{ include "litellm.fullname" . }} -o jsonpath='{.status.currentStatus}'
+  {{- end }}
 {{- end }}
 {{- if .Values.routing.route.enabled }}
   Route:     kubectl -n {{ .Release.Namespace }} get route {{ include "litellm.fullname" . }} -o jsonpath='{.spec.host}'

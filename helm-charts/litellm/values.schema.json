@@ -63,7 +63,25 @@
     "replicaCount": { "type": "integer", "minimum": 0 },
     "numWorkers": { "type": ["string", "integer"] },
     "listen": { "type": "string" },
+    "trustedProxies": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Addresses whose X-Forwarded-* headers are believed (FORWARDED_ALLOW_IPS). An IP, a CIDR, or \"*\"."
+    },
     "serverRootPath": { "type": "string", "pattern": "^(|/[^/].*[^/]|/[^/])$" },
+    "docs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Path the Swagger UI is served on, relative to serverRootPath. \"/\" restores upstream's mount-root behaviour."
+        }
+      }
+    },
 
     "image": {
       "type": "object",
@@ -394,6 +412,10 @@
           "required": ["enabled"],
           "properties": {
             "enabled": { "type": "boolean" },
+            "delegated": {
+              "type": "boolean",
+              "description": "Render a child proxy with no virtualhost, for a parent HTTPProxy that includes this one."
+            },
             "ingressClassName": { "type": "string" },
             "tls": {
               "type": "object",

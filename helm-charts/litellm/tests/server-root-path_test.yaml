@@ -5,23 +5,43 @@ release:
 templates:
   - templates/deployment.yaml
 tests:
-  - it: stays at the root by default
-    asserts:
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SERVER_ROOT_PATH
-
-  - it: moves the proxy under a prefix
-    set:
-      serverRootPath: /litellm
-      routing.path: /litellm
+  - it: mounts the proxy under /litellm by default
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: SERVER_ROOT_PATH
             value: /litellm
+
+  # `notContains` compares the whole env entry, so matching on `name` alone
+  # would pass against any value and assert nothing. Match the default entry
+  # exactly, then confirm no other prefix took its place.
+  - it: claims the domain root when the prefix is cleared
+    set:
+      serverRootPath: ""
+      routing.path: /
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SERVER_ROOT_PATH
+            value: /litellm
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SERVER_ROOT_PATH
+            value: ""
+
+  - it: moves the proxy under a different prefix
+    set:
+      serverRootPath: /gateway
+      routing.path: /gateway
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SERVER_ROOT_PATH
+            value: /gateway
 
   - it: leaves the probes on the root paths
     set:

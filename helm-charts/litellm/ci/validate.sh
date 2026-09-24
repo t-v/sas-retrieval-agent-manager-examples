@@ -66,6 +66,16 @@ assert_present "model_list" "$out/config.yaml" \
 # The checksum is what makes a `helm upgrade` roll the pods onto a new catalog.
 assert_present "checksum/config" "$out/config.yaml" \
   "The pod template must carry a checksum of the config ConfigMap."
+# The chart ships mounted under a prefix rather than claiming the whole host.
+# A stock install that silently took the root back would break every
+# neighbouring application on the hostname.
+assert_present 'value: "/litellm"' "$out/config.yaml" \
+  "A default install must set SERVER_ROOT_PATH to /litellm."
+# Without this the pod treats the ingress's plaintext hop as the client's own
+# scheme and redirects browsers to http://, downgrading a release the chart
+# published over HTTPS.
+assert_present "FORWARDED_ALLOW_IPS" "$out/config.yaml" \
+  "A default install must trust the ingress's X-Forwarded-* headers."
 assert_absent "store_model_in_db" "$out/config.yaml" \
   "The config flow must not set store_model_in_db."
 # No database means no migration Job.

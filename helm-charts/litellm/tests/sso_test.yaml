@@ -43,6 +43,9 @@ tests:
   - it: derives the browser-facing base URL from the routing block
     templates:
       - templates/deployment.yaml
+    set:
+      serverRootPath: ""
+      routing.path: /
     asserts:
       # Derived rather than restated, so the redirect URI cannot drift out of
       # step with the Ingress after someone edits one and not the other.
@@ -52,12 +55,11 @@ tests:
             name: PROXY_BASE_URL
             value: https://llm.example.com
 
+  # The chart's default prefix, not an override: a redirect URI that dropped
+  # it would be rejected by the provider on a stock install.
   - it: includes the root path in the derived base URL
     templates:
       - templates/deployment.yaml
-    set:
-      serverRootPath: /litellm
-      routing.path: /litellm
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
