@@ -198,4 +198,105 @@ if [[ "$tags" != *":${app_version}" ]]; then
 fi
 echo "Both containers run $tags."
 
+echo "── Every value the schema declares is mentioned in the README ────────────"
+# This chart documents its values in a curated table grouped by topic, rather
+# than with the flat alphabetical table helm-docs generates from '# --'
+# comments. That is a deliberate choice and the better document: it explains
+# which values matter and how they interact, which a generated table cannot.
+#
+# The cost of choosing it is that nothing regenerates the table, so a value
+# added or renamed in values.yaml leaves the README quietly wrong. This closes
+# that gap without giving up the curation -- it asserts coverage rather than
+# byte-equality, so the prose stays hand-written and only genuinely
+# undocumented values fail the build.
+#
+# Measured at 225/243 leaves when this was added; the 18 exceptions below are
+# listed individually so that adding to them is a visible decision.
+python3 - "$CHART_PATH" <<'PY'
+import json
+import re
+import sys
+
+chart = sys.argv[1]
+
+# Values that are deliberately undocumented: Helm boilerplate every chart has,
+# and probe/annotation passthroughs whose meaning is upstream Kubernetes rather
+# than anything this chart decides.
+ALLOWED = {
+    "nameOverride", "fullnameOverride",
+    "serviceAccount.automount", "serviceAccount.name",
+    "deploymentMinReadySeconds",
+    "masterKey.existingSecret",
+    "sso.usePkce", "sso.userinfoEndpoint",
+    "livenessProbe", "readinessProbe", "startupProbe",
+    "redis.port", "redis.existingSecret.passwordKey",
+    "migrationJob.annotations", "migrationJob.podAnnotations",
+    "migrationJob.extraInitContainers",
+}
+
+with open(f"{chart}/README.md", encoding="utf-8") as handle:
+    readme = handle.read()
+with open(f"{chart}/values.schema.json", encoding="utf-8") as handle:
+    schema = json.load(handle)
+
+# Any dotted path the README mentions inside a code span counts as documented.
+#
+# The README also abbreviates sibling keys with a leading dot, sharing the
+# previous path's prefix:
+#
+#     `autoscaling.targetRequestsPerSecond`, `.targetTokensPerSecond`
+#
+# Those have to be resolved, or the check reports values that are documented
+# perfectly well. A check that cries wolf gets switched off, which would leave
+# the chart worse documented than having no check at all.
+SPAN = re.compile(r"`(\.?[a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_\[\]*]+)*|\.[a-zA-Z][a-zA-Z0-9_]*)`")
+
+mentioned = set()
+for line in readme.splitlines():
+    last_prefix = None
+    for span in SPAN.findall(line):
+        if span.startswith("."):
+            if last_prefix:
+                mentioned.add(f"{last_prefix}.{span.lstrip('.')}")
+            continue
+        mentioned.add(span)
+        # Only a dotted path can act as a prefix for the shorthand; a bare word
+        # like `true` in the same cell must not become one.
+        if "." in span:
+            last_prefix = span.rsplit(".", 1)[0]
+
+leaves = []
+
+def walk(node, prefix):
+    if not isinstance(node, dict):
+        return
+    props = node.get("properties")
+    if isinstance(props, dict) and props:
+        for name, child in props.items():
+            walk(child, f"{prefix}.{name}" if prefix else name)
+    elif prefix:
+        leaves.append(prefix)
+
+walk(schema, "")
+
+def covered(path):
+    # An ancestor is enough: documenting `models` covers `models[0].model_name`.
+    parts = path.split(".")
+    return any(".".join(parts[:i]) in mentioned for i in range(len(parts), 0, -1))
+
+missing = sorted(p for p in leaves if not covered(p) and p not in ALLOWED)
+
+if missing:
+    print("These values are declared in values.schema.json but appear nowhere", file=sys.stderr)
+    print("in README.md, so nobody installing this chart can find out what they", file=sys.stderr)
+    print("do. Document them, or add them to ALLOWED in this script with a", file=sys.stderr)
+    print("reason:", file=sys.stderr)
+    for path in missing:
+        print(f"  {path}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"All {len(leaves) - len(ALLOWED)} documented values are covered "
+      f"({len(ALLOWED)} deliberate exceptions).")
+PY
+
 echo "litellm render checks passed."

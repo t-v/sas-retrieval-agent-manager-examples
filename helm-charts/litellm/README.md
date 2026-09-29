@@ -1080,6 +1080,7 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `migrationJob.hooks.helm.enabled` | Required for repeated upgrades | `true` |
 | `migrationJob.hooks.helm.weight` | | `"1"` |
 | `migrationJob.hooks.argocd.enabled` | Turn on only with the Helm hook off | `false` |
+| `migrationJob.hooks.argocd.syncWave` | Must be above `database.init.hooks.argocd.syncWave`, so the role exists before the migration runs | `"0"` |
 | `migrationJob.backoffLimit` | | `4` |
 | `migrationJob.activeDeadlineSeconds` | Whole-Job budget; `null` to disable | `1800` |
 | `migrationJob.ttlSecondsAfterFinished` | | `120` |
