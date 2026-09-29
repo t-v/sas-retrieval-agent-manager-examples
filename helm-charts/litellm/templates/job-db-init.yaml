@@ -18,13 +18,7 @@ metadata:
   labels:
     {{- include "litellm.dbInit.labels" . | nindent 4 }}
   annotations:
-    {{- include "litellm.dbInit.hookAnnotations" (dict "root" . "weight" .Values.database.init.hooks.helm.weight) | nindent 4 }}
-    {{- with .Values.commonAnnotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-    {{- with .Values.database.init.annotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
+    {{- include "litellm.dbInit.hookAnnotations" (dict "root" . "weight" .Values.database.init.hooks.helm.weight "extra" (list .Values.commonAnnotations .Values.database.init.annotations)) | nindent 4 }}
 spec:
   backoffLimit: {{ .Values.database.init.backoffLimit }}
   ttlSecondsAfterFinished: {{ .Values.database.init.ttlSecondsAfterFinished }}

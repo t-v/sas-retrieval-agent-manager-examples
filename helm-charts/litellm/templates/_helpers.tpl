@@ -407,26 +407,62 @@ Invoke with a dict: (dict "root" $ "weight" "-10").
 {{- end -}}
 
 {{/*
-Generic hook annotations, driven by a `hooks` block of the shape every Job in
-this chart uses.
+Annotations for a hook object, driven by a `hooks` block of the shape every Job
+in this chart uses, merged with whatever the caller wants to add.
 
-Invoke with a dict: (dict "hooks" .Values.<thing>.hooks "weight" "-10").
+Invoke with a dict:
+  (dict "hooks" .Values.<thing>.hooks "weight" "-10" "extra" (list .Values.commonAnnotations .Values.<thing>.annotations))
 
 `weight` is passed separately so the objects a Job depends on can be ordered
 ahead of the Job itself while sharing one hooks configuration.
+
+`extra` is a list of annotation maps, applied in order with later entries
+winning, and all of them beating the hook annotations below. Merged into one
+map rather than concatenated as text: rendering the chart's annotations and
+then the caller's underneath emits the same key twice, and while Kubernetes
+happens to accept that and keep the last one, a manifest that contains
+`argocd.argoproj.io/sync-wave` twice is not something anyone should have to
+reason about.
+
+THE SYNC WAVE IS THE HOOK WEIGHT. They are the same idea in two dialects --
+"run this before that" -- and every place this chart previously set both, it
+set them to the same number. A separate `syncWave` value was only a second
+thing to keep in step, and the one place the two disagreed was the migration
+Job, whose wave was never rendered at all.
+
+What a wave should be depends on the Application it is synced into: how the
+surrounding waves are numbered, whether the database is managed by this chart
+at all. A chart schema cannot know that, so it is not a value here -- override
+the annotation directly and it wins, like any other.
 */}}
 {{- define "litellm.hookAnnotations" -}}
 {{- $hooks := .hooks -}}
-{{- if $hooks.helm.enabled }}
-helm.sh/hook: pre-install,pre-upgrade
-helm.sh/hook-delete-policy: before-hook-creation
-helm.sh/hook-weight: {{ .weight | quote }}
-{{- end }}
-{{- if $hooks.argocd.enabled }}
-argocd.argoproj.io/hook: PreSync
-argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
-argocd.argoproj.io/sync-wave: {{ $hooks.argocd.syncWave | quote }}
-{{- end }}
+{{- $weight := .weight | toString -}}
+{{- $ann := dict -}}
+{{- if $hooks.helm.enabled -}}
+{{- $_ := set $ann "helm.sh/hook" "pre-install,pre-upgrade" -}}
+{{- $_ := set $ann "helm.sh/hook-delete-policy" "before-hook-creation" -}}
+{{- $_ := set $ann "helm.sh/hook-weight" $weight -}}
+{{- end -}}
+{{- if $hooks.argocd.enabled -}}
+{{- $_ := set $ann "argocd.argoproj.io/hook" "PreSync" -}}
+{{- $_ := set $ann "argocd.argoproj.io/hook-delete-policy" "BeforeHookCreation" -}}
+{{- $_ := set $ann "argocd.argoproj.io/sync-wave" $weight -}}
+{{- end -}}
+{{/*
+  Reversed so that the LAST map the caller listed is the first source `merge`
+  sees, and therefore the one that wins: `merge` keeps the value it already
+  holds for a key. deepCopy because merge mutates its destination, and these
+  maps come straight from .Values.
+*/}}
+{{- $merged := dict -}}
+{{- range reverse (.extra | default list) -}}
+{{- $merged = merge $merged (deepCopy (. | default dict)) -}}
+{{- end -}}
+{{- $merged = merge $merged $ann -}}
+{{- with $merged -}}
+{{- toYaml . -}}
+{{- end -}}
 {{- end -}}
 
 {{/* ── Config file ─────────────────────────────────────────────────────── */}}

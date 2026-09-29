@@ -408,7 +408,6 @@ sso:
         weight: "2"
       argocd:
         enabled: false
-        syncWave: "2"
 
 # ─── Service ─────────────────────────────────────────────────────────────────
 service:
@@ -778,11 +777,11 @@ database:
       helm:
         enabled: true
         weight: "-5"
-      # Turn this on and the Helm hook off under a GitOps controller. The sync
-      # wave orders this Job ahead of the migration Job.
+      # Turn this on and the Helm hook off under a GitOps controller. The weight
+      # above is reused as the sync wave, so this Job stays ahead of the
+      # migration Job under either controller.
       argocd:
         enabled: false
-        syncWave: "-5"
 
 # ─── Redis ───────────────────────────────────────────────────────────────────
 # The proxy's coordination store: cross-pod tpm/rpm limits, spend tracking, and
@@ -834,9 +833,6 @@ migrationJob:
     # as a PreSync hook. Running both at once migrates twice.
     argocd:
       enabled: false
-      # Ordered after database.init.hooks.argocd.syncWave, so the database
-      # exists before the migration runs.
-      syncWave: "0"
 
 # ─── Scaling ─────────────────────────────────────────────────────────────────
 autoscaling:

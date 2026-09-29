@@ -695,6 +695,22 @@ The Job is a Helm hook at weight `-5`, ahead of the migration Job at `1`. The ch
 
 Under a GitOps controller, turn `hooks.helm.enabled` off and `hooks.argocd.enabled` on; the sync waves keep the same order.
 
+The wave is the hook weight. They express the same thing in two dialects, so the
+chart does not ask for both — there is no `syncWave` value to keep in step with
+the weight beside it.
+
+A wave is only meaningful relative to everything else in the same ArgoCD
+Application, which the chart cannot see: how the surrounding Applications are
+numbered, or whether the database is provisioned by this chart at all. Where the
+defaults do not fit, set the annotation directly — it is applied after the
+chart's own and so takes precedence:
+
+```yaml
+migrationJob:
+  annotations:
+    argocd.argoproj.io/sync-wave: "12"
+```
+
 ### Ordinary failures
 
 - **`password authentication failed`** for the admin user: `admin.username` is not a login that may `CREATE DATABASE` and `CREATE ROLE`. On a managed service this is the server administrator, not `postgres`.
@@ -1057,8 +1073,8 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `database.init.image.*` | Needs `psql` and `pg_isready` | `postgres:17-alpine` |
 | `database.init.kubectlImage.*` | Cleanup container only | `registry.k8s.io/kubectl:v1.34.0` |
 | `database.init.serviceAccount.create` | ServiceAccount, Role, and RoleBinding for the cleanup container | `true` |
-| `database.init.hooks.helm.weight` | Must be below `migrationJob.hooks.helm.weight` | `"-5"` |
-| `database.init.hooks.argocd.enabled`, `.syncWave` | | `false`, `"-5"` |
+| `database.init.hooks.helm.weight` | Must be below `migrationJob.hooks.helm.weight`. Also used as the ArgoCD sync wave | `"-5"` |
+| `database.init.hooks.argocd.enabled` | | `false` |
 | `database.init.backoffLimit`, `.ttlSecondsAfterFinished`, `.activeDeadlineSeconds` | | `4`, `120`, `900` |
 | `database.init.resources`, `.nodeSelector`, `.tolerations`, `.affinity` | | `{}` |
 | `database.init.podSecurityContext`, `.securityContext` | | `{}` |
@@ -1080,7 +1096,6 @@ Defaults are the shipped `values.yaml`. Every value is validated by `values.sche
 | `migrationJob.hooks.helm.enabled` | Required for repeated upgrades | `true` |
 | `migrationJob.hooks.helm.weight` | | `"1"` |
 | `migrationJob.hooks.argocd.enabled` | Turn on only with the Helm hook off | `false` |
-| `migrationJob.hooks.argocd.syncWave` | Must be above `database.init.hooks.argocd.syncWave`, so the role exists before the migration runs | `"0"` |
 | `migrationJob.backoffLimit` | | `4` |
 | `migrationJob.activeDeadlineSeconds` | Whole-Job budget; `null` to disable | `1800` |
 | `migrationJob.ttlSecondsAfterFinished` | | `120` |

@@ -271,8 +271,7 @@
                   "type": "object",
                   "additionalProperties": false,
                   "properties": {
-                    "enabled": { "type": "boolean" },
-                    "syncWave": { "type": ["string", "integer"] }
+                    "enabled": { "type": "boolean" }
                   }
                 }
               }
@@ -561,8 +560,7 @@
                   "type": "object",
                   "additionalProperties": false,
                   "properties": {
-                    "enabled": { "type": "boolean" },
-                    "syncWave": { "type": ["string", "integer"] }
+                    "enabled": { "type": "boolean" }
                   }
                 }
               }
@@ -629,8 +627,7 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "enabled": { "type": "boolean" },
-                "syncWave": { "type": ["string", "integer"] }
+                "enabled": { "type": "boolean" }
               }
             }
           }

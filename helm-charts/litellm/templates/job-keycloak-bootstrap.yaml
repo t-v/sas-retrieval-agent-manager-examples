@@ -16,13 +16,7 @@ metadata:
   labels:
     {{- include "litellm.keycloakBootstrap.labels" . | nindent 4 }}
   annotations:
-    {{- include "litellm.hookAnnotations" (dict "hooks" $kb.hooks "weight" $kb.hooks.helm.weight) | nindent 4 }}
-    {{- with .Values.commonAnnotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-    {{- with $kb.annotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
+    {{- include "litellm.hookAnnotations" (dict "hooks" $kb.hooks "weight" $kb.hooks.helm.weight "extra" (list .Values.commonAnnotations $kb.annotations)) | nindent 4 }}
 spec:
   backoffLimit: {{ $kb.backoffLimit }}
   ttlSecondsAfterFinished: {{ $kb.ttlSecondsAfterFinished }}
